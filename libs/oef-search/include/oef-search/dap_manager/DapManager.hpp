@@ -472,7 +472,7 @@ protected:
           auto sp = future_wp.lock();
           if (sp)
           {
-            if (source_distance <= distance)
+            if (source_distance >= distance)
             {
               sp->set(true);
             }
