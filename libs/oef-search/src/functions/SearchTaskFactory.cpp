@@ -20,6 +20,15 @@
 #include "oef-base/threading/FutureCombiner.hpp"
 #include "oef-search/functions/ReplyMethods.hpp"
 #include "oef-search/functions/SearchTaskFactory.hpp"
+#include "oef-base/monitoring/Counter.hpp"
+#include "oef-base/monitoring/Gauge.hpp"
+
+Counter query_count("oef-search.search-task.query");
+Counter success_count("oef-search.search-task.query.success");
+Counter empty_count("oef-search.search-task.query.empty");
+Counter error_count("oef-search.search-task.query.error");
+Counter ignored_count("oef-search.search-task.query.ignored");
+Gauge   query_exec_time("oef-search.searcu-task.query-time.10ms");
 
 void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharArrayBuffer &data)
 {
@@ -30,6 +39,9 @@ void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharA
 
   if (current_uri.path == "/search")
   {
+    auto start = std::chrono::system_clock::now();
+
+    query_count++;
     fetch::oef::pb::SearchQuery query;
     try
     {
@@ -38,18 +50,19 @@ void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharA
 
       auto handle_query_result = dap_manager_->ShouldQueryBeHandled(query);
       handle_query_result->MakeNotification().Then([this_wp, handle_query_result, current_uri,
-                                                    query]() mutable {
+                                                    query, start]() mutable {
         auto sp = this_wp.lock();
         if (sp)
         {
           if (handle_query_result->get())
           {
             FETCH_LOG_INFO(LOGGING_NAME, "Query accepted! Moving to handler function..");
-            sp->HandleQuery(query, current_uri);
+            sp->HandleQuery(query, current_uri, start);
           }
           else
           {
             FETCH_LOG_INFO(LOGGING_NAME, "Query ignored!");
+            ignored_count++;
             auto empty = std::make_shared<IdentifierSequence>();
             empty->mutable_status()->set_success(false);
             empty->mutable_status()->add_narrative("Ignored");
@@ -58,6 +71,7 @@ void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharA
         }
         else
         {
+          error_count++;
           FETCH_LOG_WARN(LOGGING_NAME, "Failed to lock weak pointer, query cannot be executed!");
         }
         handle_query_result.reset();
@@ -65,6 +79,7 @@ void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharA
     }
     catch (std::exception &e)
     {
+      error_count++;
       FETCH_LOG_ERROR(LOGGING_NAME, "EXCEPTION: ", e.what());
       SendExceptionReply("search", current_uri, e, endpoint);
     }
@@ -148,7 +163,8 @@ void SearchTaskFactory::ProcessMessageWithUri(const Uri &current_uri, ConstCharA
   }
 }
 
-void SearchTaskFactory::HandleQuery(fetch::oef::pb::SearchQuery &query, const Uri &current_uri)
+void SearchTaskFactory::HandleQuery(fetch::oef::pb::SearchQuery &query, const Uri &current_uri,
+    const std::chrono::time_point<std::chrono::system_clock>& start_time)
 {
   auto                             this_sp = shared_from_this();
   std::weak_ptr<SearchTaskFactory> this_wp = this_sp;
@@ -163,7 +179,7 @@ void SearchTaskFactory::HandleQuery(fetch::oef::pb::SearchQuery &query, const Ur
 
   auto visit_future = dap_manager_->VisitQueryTreeLocal(root);
 
-  visit_future->MakeNotification().Then([root, this_wp, current_uri, query]() mutable {
+  visit_future->MakeNotification().Then([root, this_wp, current_uri, query, start_time]() mutable {
     FETCH_LOG_INFO(LOGGING_NAME, "--------------------- QUERY TREE");
     root->Print();
     FETCH_LOG_INFO(LOGGING_NAME, "---------------------");
@@ -172,12 +188,13 @@ void SearchTaskFactory::HandleQuery(fetch::oef::pb::SearchQuery &query, const Ur
     if (sp)
     {
       sp->dap_manager_->SetQueryHeader(
-          root, query, [sp, root, current_uri](fetch::oef::pb::SearchQuery &query) mutable {
-            sp->ExecuteQuery(root, query, current_uri);
+          root, query, [sp, root, current_uri, start_time](fetch::oef::pb::SearchQuery &query) mutable {
+            sp->ExecuteQuery(root, query, current_uri, start_time);
           });
     }
     else
     {
+      error_count++;
       FETCH_LOG_WARN(LOGGING_NAME,
                      "Query execution failed, because SearchTaskFactory weak ptr can't be locked!");
     }
@@ -186,7 +203,8 @@ void SearchTaskFactory::HandleQuery(fetch::oef::pb::SearchQuery &query, const Ur
 
 void SearchTaskFactory::ExecuteQuery(std::shared_ptr<Branch> &          root,
                                      const fetch::oef::pb::SearchQuery &query,
-                                     const Uri &                        current_uri)
+                                     const Uri &                        current_uri,
+                                     const std::chrono::time_point<std::chrono::system_clock>& start_time)
 {
   auto                             this_sp = shared_from_this();
   std::weak_ptr<SearchTaskFactory> this_wp = this_sp;
@@ -205,13 +223,21 @@ void SearchTaskFactory::ExecuteQuery(std::shared_ptr<Branch> &          root,
   result_future->AddFuture(dap_manager_->execute(root, query));
   result_future->AddFuture(dap_manager_->broadcast(query));
 
-  result_future->MakeNotification().Then([result_future, this_wp, current_uri]() mutable {
+  result_future->MakeNotification().Then([result_future, this_wp, current_uri, start_time]() mutable {
+    success_count++;
     auto result = result_future->Get();
     if (result->identifiers_size() > 0)
     {
       result->mutable_status()->set_success(true);
     }
+    else
+    {
+      empty_count++;
+    }
     FETCH_LOG_INFO(LOGGING_NAME, "Search response: ", result->DebugString());
+    auto end = std::chrono::system_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end-start_time);
+    query_exec_time.add(static_cast<std::size_t>(elapsed.count()/10.));
     auto sp = this_wp.lock();
     if (sp)
     {

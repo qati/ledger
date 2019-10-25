@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <utility>
+#include <chrono>
 
 #include "logging/logging.hpp"
 #include "oef-base/conversation/OutboundConversation.hpp"
@@ -27,6 +28,7 @@
 #include "oef-base/threading/ExitState.hpp"
 #include "oef-base/threading/StateMachineTask.hpp"
 #include "oef-base/utils/Uri.hpp"
+#include "oef-base/monitoring/Gauge.hpp"
 
 template <typename IN_PROTO, typename OUT_PROTO>
 class DapConversationTask
@@ -54,6 +56,8 @@ public:
     , path_{std::move(path)}
     , msg_id_(msg_id)
     , protocol_{std::move(protocol)}
+    , execution_time_count_(("oef-search.dap-conversation."+dap_name+"."+path).c_str())
+    , measure_time_{false}
   {
     entryPoint.push_back(&SelfType::CreateConversation);
     entryPoint.push_back(&SelfType::HandleResponse);
@@ -77,6 +81,11 @@ public:
     if (!protocol_.empty())
     {
       protocol_ += "://";
+    }
+    else
+    {
+      measure_time_ = true;
+      start_time_ = std::chrono::system_clock::now();
     }
   }
 
@@ -170,6 +179,12 @@ public:
       messageHandler(std::move(response));
       (*task_succeeded)++;
       wake();
+      if (measure_time_)
+      {
+        auto end = std::chrono::system_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_time_);
+        execution_time_count_.add(static_cast<std::size_t>(elapsed.count() / 10.));
+      }
     }
     else
     {
@@ -214,6 +229,10 @@ protected:
   std::shared_ptr<Counter> task_succeeded;
 
   std::vector<EntryPoint> entryPoint;
+
+  Gauge execution_time_count_;
+  bool measure_time_;
+  std::chrono::time_point<std::chrono::system_clock> start_time_;
 
 private:
   DapConversationTask(const DapConversationTask &other) = delete;  // { copy(other); }

@@ -35,9 +35,11 @@
 #include "visitors/FindGeoLocationVisitor.hpp"
 #include "visitors/PopulateActionsVisitorDescentPass.hpp"
 #include "visitors/PopulateFieldInformationVisitor.hpp"
+#include "oef-base/monitoring/Gauge.hpp"
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <chrono>
 
 class DapManager : public std::enable_shared_from_this<DapManager>
 {
@@ -200,6 +202,8 @@ public:
 
   std::shared_ptr<Future<bool>> ShouldQueryBeHandled(fetch::oef::pb::SearchQuery &query)
   {
+    auto start = std::chrono::system_clock::now();
+
     auto result = std::make_shared<Future<bool>>();
 
     if (query.ttl() > 1024)
@@ -219,7 +223,7 @@ public:
         bool has_topic = query.directed_search().target().has_topic();
         if (has_geo)
         {
-          PlaneDistanceCheck("geo", query.directed_search(), result);
+          PlaneDistanceCheck("geo", query.directed_search(), result, start);
         }
         if (has_topic)
         {
@@ -249,6 +253,8 @@ public:
   std::shared_ptr<FutureComplexType<std::shared_ptr<IdentifierSequence>>> execute(
       std::shared_ptr<Branch> root, const fetch::oef::pb::SearchQuery &query)
   {
+    auto start_time = std::chrono::system_clock::now();
+
     auto result    = std::make_shared<FutureComplexType<std::shared_ptr<IdentifierSequence>>>();
     auto visit_res = VisitQueryTreeNetwork(root);
 
@@ -263,7 +269,7 @@ public:
     }
 
     visit_res->MakeNotification().Then([result, root, identifier_sequence, this_sp,
-                                        distance]() mutable {
+                                        distance, start_time]() mutable {
       FETCH_LOG_INFO(LOGGING_NAME, "--------------------- AFTER VISIT");
       root->Print();
       FETCH_LOG_INFO(LOGGING_NAME, "---------------------");
@@ -272,13 +278,16 @@ public:
           NodeExecutorFactory(BranchExecutorTask::NodeDataType(root), identifier_sequence, this_sp);
 
       execute_task->SetMessageHandler(
-          [result, distance](std::shared_ptr<IdentifierSequence> response) {
+          [result, distance, start_time](std::shared_ptr<IdentifierSequence> response) {
             response->mutable_status()->set_success(true);
             for (int i = 0; i < response->identifiers_size(); ++i)
             {
               response->mutable_identifiers(i)->set_distance(distance);
             }
             result->set(std::move(response));
+            auto end = std::chrono::system_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end-start_time);
+            Gauge("oef-search.manager.query-execute.10ms").add(static_cast<std::size_t>(elapsed.count()/10.));
           });
 
       execute_task->submit();
@@ -346,6 +355,8 @@ public:
   std::shared_ptr<FutureComplexType<std::shared_ptr<IdentifierSequence>>> broadcast(
       const fetch::oef::pb::SearchQuery &query)
   {
+    auto start_time = std::chrono::system_clock::now();
+
     query_id_cache_->Add(query.id());
 
     auto result  = std::make_shared<FutureComplexType<std::shared_ptr<IdentifierSequence>>>();
@@ -353,7 +364,7 @@ public:
     std::weak_ptr<DapManager> this_wp = this_sp;
     FETCH_LOG_INFO(LOGGING_NAME, "Broadcast started");
     auto q = std::make_shared<fetch::oef::pb::SearchQuery>(query);
-    DoBroadcast(result, q);
+    DoBroadcast(result, q, start_time);
 
     return result;
   }
@@ -462,13 +473,14 @@ protected:
 
   void PlaneDistanceCheck(const std::string &                               plane,
                           const fetch::oef::pb::SearchQuery_DirectedSearch &header,
-                          std::shared_ptr<Future<bool>> &                   future)
+                          std::shared_ptr<Future<bool>> &                   future,
+                          const std::chrono::time_point<std::chrono::system_clock>& start_time)
   {
     std::weak_ptr<Future<bool>> future_wp = future;
 
     bool resp = PlaneDistanceLookup(
         plane, header,
-        [future_wp](const double &source_distance, const double &distance) {
+        [future_wp, start_time](const double &source_distance, const double &distance) {
           auto sp = future_wp.lock();
           if (sp)
           {
@@ -482,6 +494,9 @@ protected:
                              distance, ") is greater then source distance (", source_distance, ")");
               sp->set(false);
             }
+            auto end = std::chrono::system_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end-start_time);
+            Gauge("oef-search.manager.query-validation.10ms").add(static_cast<std::size_t>(elapsed.count()/10.));
           }
           else
           {
@@ -594,7 +609,8 @@ protected:
   }
 
   void DoBroadcast(std::shared_ptr<FutureComplexType<std::shared_ptr<IdentifierSequence>>> &future,
-                   std::shared_ptr<fetch::oef::pb::SearchQuery>                             query)
+                   std::shared_ptr<fetch::oef::pb::SearchQuery>                             query,
+                   const std::chrono::time_point<std::chrono::system_clock>& start_time)
   {
     auto convTask = std::make_shared<
         DapParallelConversationTask<fetch::oef::pb::SearchQuery, IdentifierSequence>>(
@@ -607,7 +623,7 @@ protected:
     });
     FETCH_LOG_INFO(LOGGING_NAME, "Submit broadcast tasks..");
     convTask->submit();
-    convTask->MakeNotification().Then([future, convTask]() {
+    convTask->MakeNotification().Then([future, convTask, start_time]() {
       auto idseq = std::make_shared<IdentifierSequence>();
       FETCH_LOG_INFO(LOGGING_NAME, "Broadcast done");
       std::size_t idx = 0;
@@ -635,6 +651,9 @@ protected:
         ++idx;
       }
       future->set(std::move(idseq));
+      auto end = std::chrono::system_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end-start_time);
+      Gauge("oef-search.manager.query-broadcast.10ms").add(static_cast<std::size_t>(elapsed.count()/10.));
     });
   }
 

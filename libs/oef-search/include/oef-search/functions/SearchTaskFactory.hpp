@@ -52,9 +52,9 @@ protected:
   virtual void EndpointClosed()
   {}
 
-  void HandleQuery(fetch::oef::pb::SearchQuery &query, const Uri &current_uri);
+  void HandleQuery(fetch::oef::pb::SearchQuery &query, const Uri &current_uri, const std::chrono::time_point<std::chrono::system_clock>& start_time);
   void ExecuteQuery(std::shared_ptr<Branch> &root, const fetch::oef::pb::SearchQuery &query,
-                    const Uri &current_uri);
+                    const Uri &current_uri, const std::chrono::time_point<std::chrono::system_clock>& start_time);
 
 protected:
   std::shared_ptr<DapManager> dap_manager_;
